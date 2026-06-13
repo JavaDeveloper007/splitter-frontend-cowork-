@@ -1,10 +1,12 @@
-﻿import { create } from 'zustand';
+import { create } from 'zustand';
 import type {
   FinalizeReceiptResponse,
   FinalizeReceiptItemPayload,
   FinalizeTotalsByItem,
   FinalizeTotalsByParticipant,
   ParseReceiptRequest,
+  ParseReceiptByUrlRequest,
+  ParseReceiptLocalRequest,
   ParseReceiptResponse,
   ReceiptParticipant,
   ReceiptSummary,
@@ -12,6 +14,10 @@ import type {
   ReceiptAllocation,
 } from '@/features/receipt/api/receipt.api';
 import { ReceiptApi } from '@/features/receipt/api/receipt.api';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export type ScanMode = 'gemini' | 'qr' | 'local';
 
 export type CapturedReceiptImage = {
   uri?: string;
@@ -55,6 +61,8 @@ export type FinishPayload = {
   currency?: string;
 };
 
+// ─── Store interface ──────────────────────────────────────────────────────────
+
 interface ReceiptSessionStore {
   capture?: CapturedReceiptImage;
   parsing: boolean;
@@ -62,7 +70,7 @@ interface ReceiptSessionStore {
   session?: ReceiptSessionMeta;
   items: ReceiptSplitItem[];
   participants: ReceiptParticipant[];
-  currency: string; // ✅ Добавлено поле для валюты
+  currency: string;
   finalizing: boolean;
   finalizeError?: string;
   finalized?: FinalizeReceiptResponse;
@@ -72,18 +80,23 @@ interface ReceiptSessionStore {
   clearCapture: () => void;
   setSessionName: (sessionName: string) => void;
   setParticipants: (participants: ReceiptParticipant[]) => void;
-  setCurrency: (currency: string) => void; // ✅ Добавлен метод
+  setCurrency: (currency: string) => void;
   updateItem: (itemId: string, updater: (prev: ReceiptSplitItem) => ReceiptSplitItem) => void;
   setItems: (items: ReceiptSplitItem[]) => void;
   setLastFinishPayload: (payload?: FinishPayload) => void;
 
   parseReceipt: (payload: ParseReceiptRequest) => Promise<ParseReceiptResponse>;
+  parseReceiptByUrl: (payload: ParseReceiptByUrlRequest) => Promise<ParseReceiptResponse>;
+  parseReceiptLocal: (payload: ParseReceiptLocalRequest) => Promise<ParseReceiptResponse>;
   finalizeSession: () => Promise<FinalizeReceiptResponse>;
   reset: () => void;
 }
 
+// ─── Initial state ────────────────────────────────────────────────────────────
+
 const INITIAL_STATE: Pick<ReceiptSessionStore,
-  'capture' | 'parsing' | 'parseError' | 'session' | 'items' | 'participants' | 'currency' | 'finalizing' | 'finalizeError' | 'finalized' | 'lastFinishPayload'
+  'capture' | 'parsing' | 'parseError' | 'session' | 'items' | 'participants' |
+  'currency' | 'finalizing' | 'finalizeError' | 'finalized' | 'lastFinishPayload'
 > = {
   capture: undefined,
   parsing: false,
@@ -91,12 +104,48 @@ const INITIAL_STATE: Pick<ReceiptSessionStore,
   session: undefined,
   items: [],
   participants: [],
-  currency: 'UZS', // ✅ Значение по умолчанию
+  currency: 'UZS',
   finalizing: false,
   finalizeError: undefined,
   finalized: undefined,
   lastFinishPayload: undefined,
 };
+
+// ─── Helper — applies parse response to store state ───────────────────────────
+
+function buildSplitItems(response: ParseReceiptResponse): ReceiptSplitItem[] {
+  return response.items.map((item) => ({
+    id: item.id,
+    name: item.name,
+    unitPrice: item.unitPrice,
+    quantity: item.quantity,
+    totalPrice: item.totalPrice,
+    kind: item.kind,
+    splitMode: item.quantity > 1 ? 'count' : 'equal',
+    assignedTo: [],
+    perPersonCount: {},
+  }));
+}
+
+function applyParseResponse(response: ParseReceiptResponse) {
+  return {
+    parsing: false,
+    parseError: undefined,
+    session: {
+      sessionId: response.sessionId,
+      sessionName: response.sessionName,
+      language: response.language,
+      summary: response.summary,
+    },
+    items: buildSplitItems(response),
+    participants: [],
+    currency: response.summary?.currency || 'UZS',
+    finalized: undefined,
+    finalizeError: undefined,
+  };
+}
+
+// ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useReceiptSessionStore = create<ReceiptSessionStore>((set, get) => ({
   ...INITIAL_STATE,
@@ -112,56 +161,52 @@ export const useReceiptSessionStore = create<ReceiptSessionStore>((set, get) => 
   },
 
   setParticipants: (participants) => set({ participants }),
-
-  setCurrency: (currency) => set({ currency }), // ✅ Новый метод
-
+  setCurrency: (currency) => set({ currency }),
   updateItem: (itemId, updater) => {
     set((state) => ({
       items: state.items.map((item) => item.id === itemId ? updater(item) : item),
     }));
   },
-
   setItems: (items) => set({ items }),
   setLastFinishPayload: (payload) => set({ lastFinishPayload: payload }),
 
+  // Gemini AI (camera)
   parseReceipt: async (payload) => {
     set({ parsing: true, parseError: undefined });
     try {
       const response = await ReceiptApi.parse(payload);
-      const splitItems: ReceiptSplitItem[] = response.items.map((item) => ({
-        id: item.id,
-        name: item.name,
-        unitPrice: item.unitPrice,
-        quantity: item.quantity,
-        totalPrice: item.totalPrice,
-        kind: item.kind,
-        splitMode: item.quantity > 1 ? 'count' : 'equal',
-        assignedTo: [],
-        perPersonCount: {},
-      }));
-
-      // ✅ Извлекаем валюту из ответа API
-      const detectedCurrency = response.summary?.currency || 'UZS';
-
-      set({
-        parsing: false,
-        parseError: undefined,
-        session: {
-          sessionId: response.sessionId,
-          sessionName: response.sessionName,
-          language: response.language,
-          summary: response.summary,
-        },
-        items: splitItems,
-        participants: [],
-        currency: detectedCurrency, // ✅ Сохраняем валюту
-        finalized: undefined,
-        finalizeError: undefined,
-      });
-
+      set(applyParseResponse(response));
       return response;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to parse receipt';
+      set({ parsing: false, parseError: message });
+      throw error;
+    }
+  },
+
+  // QR Link
+  parseReceiptByUrl: async (payload) => {
+    set({ parsing: true, parseError: undefined });
+    try {
+      const response = await ReceiptApi.parseByUrl(payload);
+      set(applyParseResponse(response));
+      return response;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to parse receipt from QR';
+      set({ parsing: false, parseError: message });
+      throw error;
+    }
+  },
+
+  // Local AI (camera)
+  parseReceiptLocal: async (payload) => {
+    set({ parsing: true, parseError: undefined });
+    try {
+      const response = await ReceiptApi.parseLocal(payload);
+      set(applyParseResponse(response));
+      return response;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to parse receipt with local AI';
       set({ parsing: false, parseError: message });
       throw error;
     }

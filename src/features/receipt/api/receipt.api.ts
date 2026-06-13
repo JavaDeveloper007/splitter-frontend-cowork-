@@ -1,15 +1,11 @@
-﻿import { apiClient } from '@/features/auth/api';
+import { apiClient } from '@/features/auth/api';
+
+// ─── Shared types ─────────────────────────────────────────────────────────────
 
 export type ReceiptImagePayload = {
   mimeType: string;
   data: string; // base64 without data URI prefix
 };
-
-export interface ParseReceiptRequest {
-  sessionName: string;
-  language: string;
-  image: ReceiptImagePayload;
-}
 
 export type ParsedReceiptItemKind = 'item' | 'fee' | 'discount' | string;
 
@@ -24,7 +20,7 @@ export interface ParsedReceiptItem {
 
 export interface ReceiptSummary {
   grandTotal: number;
-  currency?: string; // ✅ Валюта в summary
+  currency?: string;
   [key: string]: unknown;
 }
 
@@ -34,6 +30,7 @@ export interface ParseReceiptResponse {
   language: string;
   items: ParsedReceiptItem[];
   summary?: ReceiptSummary;
+  source?: 'gemini' | 'scraper' | 'local_ai' | 'mock';
 }
 
 export type ReceiptParticipant = {
@@ -59,7 +56,7 @@ export interface FinalizeReceiptRequest {
   sessionName: string;
   participants: ReceiptParticipant[];
   items: FinalizeReceiptItemPayload[];
-  currency?: string; // ✅ Добавьте валюту в запрос
+  currency?: string;
 }
 
 export interface FinalizeTotalsByParticipant {
@@ -89,27 +86,48 @@ export interface FinalizeReceiptResponse {
   createdAt: string;
   totals: {
     grandTotal: number;
-    currency?: string; // ✅ Добавьте валюту в ответ
+    currency?: string;
     byParticipant?: FinalizeTotalsByParticipant[];
     byItem?: FinalizeTotalsByItem[];
   };
   allocations?: ReceiptAllocation[];
 }
 
+// ─── Request types per mode ───────────────────────────────────────────────────
+
+export interface ParseReceiptRequest {
+  sessionName: string;
+  language: string;
+  image: ReceiptImagePayload;
+}
+
+export interface ParseReceiptByUrlRequest {
+  sessionName: string;
+  url: string;
+}
+
+export interface ParseReceiptLocalRequest {
+  sessionName: string;
+  language: string;
+  image: ReceiptImagePayload;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 const normalizeError = (error: unknown): Error => {
   if (error instanceof Error) return error;
   return new Error('Unexpected error');
 };
 
+// ─── API ─────────────────────────────────────────────────────────────────────
+
 export const ReceiptApi = {
+
+  // Gemini AI — камера → облако
   async parse(payload: ParseReceiptRequest): Promise<ParseReceiptResponse> {
     try {
-      // console.log('[API] POST /sessions/scan');
-      // console.log('[API] Request data:', JSON.stringify(payload, null, 2));
-
       const { data } = await apiClient.post<ParseReceiptResponse>('/sessions/scan', payload);
-
-      console.log('[API] Response:', JSON.stringify(data, null, 2));
+      console.log('[API] /sessions/scan response:', JSON.stringify(data, null, 2));
       return data;
     } catch (error) {
       console.error('[API] Error (parse):', error);
@@ -117,13 +135,41 @@ export const ReceiptApi = {
     }
   },
 
+  // QR Link — ссылка с чека → scraper на бэкенде
+  async parseByUrl(payload: ParseReceiptByUrlRequest): Promise<ParseReceiptResponse> {
+    try {
+      const { data } = await apiClient.post<ParseReceiptResponse>('/sessions/scan-qr', {
+        url: payload.url,
+        sessionName: payload.sessionName,
+      });
+      console.log('[API] /sessions/scan-qr response:', JSON.stringify(data, null, 2));
+      return data;
+    } catch (error) {
+      console.error('[API] Error (parseByUrl):', error);
+      throw normalizeError(error);
+    }
+  },
+
+  // Local AI — камера → локальный FastAPI (EasyOCR + Ollama)
+  async parseLocal(payload: ParseReceiptLocalRequest): Promise<ParseReceiptResponse> {
+    try {
+      const { data } = await apiClient.post<ParseReceiptResponse>('/sessions/scan-local', {
+        sessionName: payload.sessionName,
+        language: payload.language,
+        image: payload.image,
+      });
+      console.log('[API] /sessions/scan-local response:', JSON.stringify(data, null, 2));
+      return data;
+    } catch (error) {
+      console.error('[API] Error (parseLocal):', error);
+      throw normalizeError(error);
+    }
+  },
+
   async finalize(payload: FinalizeReceiptRequest): Promise<FinalizeReceiptResponse> {
     try {
       console.log('[API] POST /sessions/finalize');
-      console.log('[API] Request data:', JSON.stringify(payload, null, 2));
-
       const { data } = await apiClient.post<FinalizeReceiptResponse>('/sessions/finalize', payload);
-
       console.log('[API] Response:', JSON.stringify(data, null, 2));
       return data;
     } catch (error) {
@@ -132,4 +178,3 @@ export const ReceiptApi = {
     }
   },
 };
-
